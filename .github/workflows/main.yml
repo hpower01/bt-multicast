@@ -70,7 +70,6 @@ jobs:
           monitor & MON=$!
           mkdir -p aosp && cd aosp
           
-          # נסיון חוזר לאתחול מול השרתים של גוגל במקרה של שגיאת 503
           for i in 1 2 3; do
             repo init -u https://android.googlesource.com/platform/manifest \
               -b "${{ inputs.aosp_branch }}" --depth=1 \
@@ -102,7 +101,6 @@ jobs:
             echo '</manifest>'
           } > .repo/local_manifests/remove.xml
 
-          # נסיון חוזר להורדה (ללא fail-fast) כדי לעקוף ניתוקים מהשרת של גוגל
           for i in 1 2 3 4 5; do
             repo sync -c -j4 --no-tags --no-clone-bundle --optimized-fetch \
               --force-sync -q && break
@@ -127,8 +125,12 @@ jobs:
           monitor &
           echo 1000 > /proc/self/oom_score_adj || true
           
-          export BUILD_BROKEN_DISABLE_BAZEL=true
+          # שימוש תקין במשתני סביבה במקום דגלים שגויים לפקודת M
           export SKIP_SOONG_TESTS=true
+          export BUILD_BROKEN_DISABLE_BAZEL=true
+          export SOONG_GEN_RUST_PROJECT=false
+          export SOONG_GEN_COMPDB=false
+          export GOMAXPROCS=2
           
           cd aosp
           export ALLOW_MISSING_DEPENDENCIES=true
@@ -139,11 +141,11 @@ jobs:
           set -e
           
           echo "Starting the build process..."
-          # מריצים עם -j4 כי הזיכרון שלך עמד יפה מאוד בעומס בריצה הקודמת
+          # פקודה נקייה לחלוטין ללא תוספות שבירות
           if [ "${{ inputs.mode }}" = "apex" ]; then
-            m -j4 --skip-soong-tests apps_only dist
+            m -j4 apps_only dist
           else
-            m -j4 --skip-soong-tests libbluetooth_jni
+            m -j4 libbluetooth_jni
           fi
 
       - name: Package Magisk module
