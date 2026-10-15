@@ -91,8 +91,7 @@ jobs:
               platform/prebuilts/jdk/jdk8 platform/prebuilts/jdk/jdk9 \
               platform/prebuilts/gradle-plugin platform/prebuilts/maven_repo/android platform/prebuilts/maven_repo/bumptech \
               platform/prebuilts/devtools platform/prebuilts/asuite platform/prebuilts/bundletool \
-              platform/prebuilts/checkcolor platform/prebuilts/ktlint platform/prebuilts/remoteexecution-client \
-              $(grep -o 'name="platform/prebuilts/module_sdk/[^"]*"' .repo/manifests/default.xml | cut -d'"' -f2)
+              platform/prebuilts/checkcolor platform/prebuilts/ktlint platform/prebuilts/remoteexecution-client
             do
               if grep -q "name=\"$p\"" .repo/manifests/default.xml; then
                 echo "  <remove-project name=\"$p\" />"
@@ -132,18 +131,16 @@ jobs:
           export TMPDIR="$GITHUB_WORKSPACE/tmp"
           cd aosp
           export ALLOW_MISSING_DEPENDENCIES=true
-          # Build a real .apex file in "apex" mode (not a flattened directory)
-          export OVERRIDE_TARGET_FLATTEN_APEX=false
           # envsetup.sh is not written for "bash -e"
           set +e
           source build/envsetup.sh
-          lunch aosp_arm64-userdebug || exit 1
+          # banchan = unbundled build of ONE Mainline module. It configures only
+          # com.android.btservices instead of the whole platform, so it does not
+          # analyze or generate platform images (which crashed, and used ~16 GB).
+          banchan com.android.btservices arm64 userdebug || exit 1
           set -e
-          if [ "${{ inputs.mode }}" = "apex" ]; then
-            m -j"$(nproc)" --soong-only --skip-soong-tests com.android.btservices
-          else
-            m -j"$(nproc)" --soong-only --skip-soong-tests libbluetooth_jni
-          fi
+          # apps_only dist builds the selected module and copies it to out/dist
+          m -j"$(nproc)" apps_only dist
 
       - name: Package Magisk module
         run: |
@@ -167,18 +164,24 @@ jobs:
           persist.bluetooth.a2dp_multicast.enabled=true
           EOF
 
+          # The finished APEX from `m apps_only dist`
+          APEX=$(find out/dist out/soong/.intermediates/packages/modules/Bluetooth/apex \
+                   -name com.android.btservices.apex -not -path '*unsigned*' 2>/dev/null | head -n1)
+          echo "apex: $APEX"
+          [ -n "$APEX" ]
+
           if [ "${{ inputs.mode }}" = "apex" ]; then
-            APEX=$(find out/target/product out/soong/.intermediates/packages/modules/Bluetooth/apex -name com.android.btservices.apex -not -path '*unsigned*' 2>/dev/null | head -n1)
-            [ -n "$APEX" ]
-            echo "apex: $APEX"
             mkdir -p "$MOD/system/apex"
-            cp "$APEX" "$MOD/system/apex/"
+            cp "$APEX" "$MOD/system/apex/com.android.btservices.apex"
             cp "$APEX" "$OUT_DIR/"
           else
-            # The APEX variant of the library (not the "unstripped" copy)
-            LIB=$(find out/soong/.intermediates/packages/modules/Bluetooth/android/app/libbluetooth_jni \
-                    -path '*android_arm64*apex*' -name libbluetooth_jni.so -not -path '*unstripped*' | head -n1)
+            # The compiled 64-bit library that goes into the APEX. Prefer the
+            # apex build variant; the stripped (not "unstripped") copy.
+            BASE=out/soong/.intermediates/packages/modules/Bluetooth/android/app/libbluetooth_jni
+            LIB=$(find "$BASE" -path '*arm64*apex*' -name libbluetooth_jni.so -not -path '*unstripped*' 2>/dev/null | head -n1)
+            [ -n "$LIB" ] || LIB=$(find "$BASE" -path '*arm64*' -name libbluetooth_jni.so -not -path '*unstripped*' 2>/dev/null | head -n1)
             echo "lib: $LIB"
+            echo "all libbluetooth_jni.so built:"; find "$BASE" -name libbluetooth_jni.so 2>/dev/null
             [ -n "$LIB" ]
             mkdir -p "$MOD/bt"
             cp "$LIB" "$MOD/bt/libbluetooth_jni.so"
