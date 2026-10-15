@@ -23,8 +23,6 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # The free runner has ~20 GB free; AOSP needs ~100 GB. Merge the free
-      # space of / and /mnt into one volume and add swap for the build.
       - name: Maximize disk space
         uses: easimon/maximize-build-space@v10
         with:
@@ -122,25 +120,24 @@ jobs:
       - name: Build
         run: |
           monitor &
-          # If memory runs out, let Linux kill the build (clear error in the log)
-          # instead of the GitHub runner agent ("lost communication").
           echo 1000 > /proc/self/oom_score_adj || true
           sudo sysctl -w vm.swappiness=100 || true
-          # Keep temporary files on the big build volume (the root disk is almost full)
           mkdir -p "$GITHUB_WORKSPACE/tmp"
           export TMPDIR="$GITHUB_WORKSPACE/tmp"
           cd aosp
           export ALLOW_MISSING_DEPENDENCIES=true
-          # envsetup.sh is not written for "bash -e"
           set +e
           source build/envsetup.sh
-          # banchan = unbundled build of ONE Mainline module. It configures only
-          # com.android.btservices instead of the whole platform, so it does not
-          # analyze or generate platform images (which crashed, and used ~16 GB).
           banchan com.android.btservices arm64 userdebug || exit 1
           set -e
-          # apps_only dist builds the selected module and copies it to out/dist
-          m -j"$(nproc)" apps_only dist
+          
+          # `--skip-soong-tests` prevents compiling and running AOSP build system unit tests.
+          # Building `libbluetooth_jni` builds ONLY the c++ library instead of the entire APEX
+          if [ "${{ inputs.mode }}" = "apex" ]; then
+            m -j"$(nproc)" --skip-soong-tests apps_only dist
+          else
+            m -j"$(nproc)" --skip-soong-tests libbluetooth_jni
+          fi
 
       - name: Package Magisk module
         run: |
@@ -164,30 +161,27 @@ jobs:
           persist.bluetooth.a2dp_multicast.enabled=true
           EOF
 
-          # The finished APEX from `m apps_only dist`
-          APEX=$(find out/dist out/soong/.intermediates/packages/modules/Bluetooth/apex \
-                   -name com.android.btservices.apex -not -path '*unsigned*' 2>/dev/null | head -n1)
-          echo "apex: $APEX"
-          [ -n "$APEX" ]
-
           if [ "${{ inputs.mode }}" = "apex" ]; then
+            APEX=$(find out/dist out/soong/.intermediates/packages/modules/Bluetooth/apex \
+                     -name com.android.btservices.apex -not -path '*unsigned*' 2>/dev/null | head -n1)
+            echo "apex: $APEX"
+            [ -n "$APEX" ]
+            
             mkdir -p "$MOD/system/apex"
             cp "$APEX" "$MOD/system/apex/com.android.btservices.apex"
             cp "$APEX" "$OUT_DIR/"
           else
-            # The compiled 64-bit library that goes into the APEX. Prefer the
-            # apex build variant; the stripped (not "unstripped") copy.
-            BASE=out/soong/.intermediates/packages/modules/Bluetooth/android/app/libbluetooth_jni
-            LIB=$(find "$BASE" -path '*arm64*apex*' -name libbluetooth_jni.so -not -path '*unstripped*' 2>/dev/null | head -n1)
-            [ -n "$LIB" ] || LIB=$(find "$BASE" -path '*arm64*' -name libbluetooth_jni.so -not -path '*unstripped*' 2>/dev/null | head -n1)
+            BASE="out/soong/.intermediates/packages/modules/Bluetooth"
+            LIB=$(find "$BASE" -path '*/libbluetooth_jni/*arm64*apex*' -name libbluetooth_jni.so -not -path '*unstripped*' 2>/dev/null | head -n1)
+            [ -n "$LIB" ] || LIB=$(find "$BASE" -path '*/libbluetooth_jni/*arm64*' -name libbluetooth_jni.so -not -path '*unstripped*' 2>/dev/null | head -n1)
             echo "lib: $LIB"
             echo "all libbluetooth_jni.so built:"; find "$BASE" -name libbluetooth_jni.so 2>/dev/null
             [ -n "$LIB" ]
+            
             mkdir -p "$MOD/bt"
             cp "$LIB" "$MOD/bt/libbluetooth_jni.so"
             cp "$LIB" "$OUT_DIR/"
 
-            # Bind-mount the new library over the one inside the APEX at boot.
             cat > "$MOD/service.sh" <<'EOF'
           #!/system/bin/sh
           MODDIR=${0%/*}
@@ -201,7 +195,6 @@ jobs:
             chcon "$CTX" "$NEW"
             mount -o bind "$NEW" "$TARGET"
           done
-          # Restart Bluetooth so it loads the new library
           killall com.android.bluetooth 2>/dev/null || pkill -f com.android.bluetooth
           EOF
             chmod 755 "$MOD/service.sh"
