@@ -42,7 +42,6 @@ jobs:
       - name: Install build packages (and fix Entropy)
         run: |
           sudo apt-get update
-          # התקנת haveged קריטית למניעת קפיאה של תהליכי Java/Go בשרתי ענן
           sudo apt-get install -y git curl python3 python-is-python3 zip unzip \
             rsync libncurses5 fontconfig xsltproc libxml2-utils haveged
           sudo systemctl start haveged
@@ -116,16 +115,13 @@ jobs:
           monitor &
           echo 1000 > /proc/self/oom_score_adj || true
           
-          # --- הפתרון לחנק הדיסק בשורש (Root) ---
-          # מעבירים פיזית את תקיית /tmp לכונן הגדול שיש בו 50GB פנויים
+          # הזזת תיקיית הזמניים לכונן עם המקום הפנוי
           mkdir -p "$GITHUB_WORKSPACE/tmp"
           sudo mount --bind "$GITHUB_WORKSPACE/tmp" /tmp
           export TMPDIR="/tmp"
           export TEMP="/tmp"
           export TMP="/tmp"
           
-          # --- ניקוי מערכות רקע שתוקעות את הבנייה ---
-          export SKIP_SOONG_TESTS=true
           export USE_BAZEL=false
           export USE_BAZEL_ANALYSIS=false
           export SOONG_UI_VERBOSE=true
@@ -139,11 +135,11 @@ jobs:
           set -e
           
           echo "Starting the build process..."
-          # אנחנו מוסיפים את 'showcommands' כדי שהמערכת תדפיס למסך הכל ולא תקפא בשקט
+          # --- כאן נמצא התיקון הקריטי: --skip-soong-tests חייב להיות בתוך פקודת ה-m ---
           if [ "${{ inputs.mode }}" = "apex" ]; then
-            m -j4 showcommands apps_only dist
+            m -j2 --skip-soong-tests showcommands apps_only dist
           else
-            m -j4 showcommands libbluetooth_jni
+            m -j2 --skip-soong-tests showcommands libbluetooth_jni
           fi
 
       - name: Package Magisk module
