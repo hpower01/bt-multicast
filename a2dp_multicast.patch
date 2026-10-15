@@ -1,0 +1,166 @@
+diff --git a/system/btif/co/bta_av_co.cc b/system/btif/co/bta_av_co.cc
+index 34406f1..d07bc26 100644
+--- a/system/btif/co/bta_av_co.cc
++++ b/system/btif/co/bta_av_co.cc
+@@ -33,6 +33,7 @@
+ #include "btif/include/btif_av.h"
+ #include "include/hardware/bt_av.h"
+ #include "osi/include/osi.h"  // UNUSED_ATTR
++#include "osi/include/properties.h"
+ #include "stack/include/a2dp_codec_api.h"
+ #include "stack/include/a2dp_error_codes.h"
+ #include "stack/include/avdt_api.h"
+@@ -1462,13 +1463,24 @@ void BtaAvCo::GetPeerEncoderParameters(
+ 
+   std::lock_guard<std::recursive_mutex> lock(codec_lock_);
+ 
++  // A2DP multicast: the same encoded packets are sent to every connected
++  // sink, so they must fit the smallest MTU. Also cap it, so a sink that
++  // connects after the encoder was set up still gets packets that fit.
++  const bool multicast = osi_property_get_bool(
++      "persist.bluetooth.a2dp_multicast.enabled", false);
++
+   // Compute the MTU
+   for (size_t i = 0; i < BTA_AV_CO_NUM_ELEMENTS(peers_); i++) {
+     const BtaAvCoPeer* p_peer = &peers_[i];
+     if (!p_peer->opened) continue;
+-    if (p_peer->addr != peer_address) continue;
++    if (!multicast && p_peer->addr != peer_address) continue;
+     if (p_peer->mtu < min_mtu) min_mtu = p_peer->mtu;
+   }
++  if (multicast) {
++    uint16_t max_mtu = (uint16_t)osi_property_get_int32(
++        "persist.bluetooth.a2dp_multicast.max_mtu", 672);
++    if (max_mtu > 0 && min_mtu > max_mtu) min_mtu = max_mtu;
++  }
+   p_peer_params->peer_mtu = min_mtu;
+   p_peer_params->is_peer_edr = btif_av_is_peer_edr(peer_address);
+   p_peer_params->peer_supports_3mbps =
+diff --git a/system/btif/src/btif_av.cc b/system/btif/src/btif_av.cc
+index 8ae8db8..0dcb4e3 100644
+--- a/system/btif/src/btif_av.cc
++++ b/system/btif/src/btif_av.cc
+@@ -728,6 +728,74 @@ static BtifAvPeer* btif_av_find_active_peer() {
+   return nullptr;
+ }
+ 
++/*****************************************************************************
++ * A2DP Source multicast
++ *
++ * When persist.bluetooth.a2dp_multicast.enabled is true, the audio encoded
++ * for the active peer is also streamed to every other connected A2DP Sink.
++ * BTA AV already duplicates each media packet to all started streams
++ * (bta_av_dup_audio_buf), so btif only needs to start the non-active peers
++ * and keep them started. The encoder and the audio HAL session stay owned by
++ * the active peer.
++ *****************************************************************************/
++static bool btif_av_src_multicast_enabled() {
++  return osi_property_get_bool("persist.bluetooth.a2dp_multicast.enabled",
++                               false);
++}
++
++// A non-active peer can receive the duplicated packets only if it negotiated
++// the same codec format as the active peer (there is a single encoder).
++static bool btif_av_src_multicast_peer_compatible(const BtifAvPeer& peer) {
++  if (!peer.IsSink() || peer.IsActivePeer()) return false;
++  A2dpCodecConfig* active_codec = bta_av_get_a2dp_current_codec();
++  A2dpCodecConfig* peer_codec =
++      bta_av_get_a2dp_peer_current_codec(peer.PeerAddress());
++  if (active_codec == nullptr || peer_codec == nullptr) return false;
++  if (active_codec->codecIndex() != peer_codec->codecIndex()) {
++    LOG_WARN("%s: Peer %s : codec %d differs from active codec %d", __func__,
++             peer.PeerAddress().ToString().c_str(),
++             static_cast<int>(peer_codec->codecIndex()),
++             static_cast<int>(active_codec->codecIndex()));
++    return false;
++  }
++  btav_a2dp_codec_config_t a = active_codec->getCodecConfig();
++  btav_a2dp_codec_config_t p = peer_codec->getCodecConfig();
++  if (a.sample_rate != p.sample_rate || a.channel_mode != p.channel_mode ||
++      a.bits_per_sample != p.bits_per_sample) {
++    LOG_WARN("%s: Peer %s : codec parameters differ from the active peer",
++             __func__, peer.PeerAddress().ToString().c_str());
++    return false;
++  }
++  return true;
++}
++
++static bool btif_av_src_multicast_peer(const BtifAvPeer& peer) {
++  return btif_av_src_multicast_enabled() &&
++         btif_av_src_multicast_peer_compatible(peer);
++}
++
++// Start every opened, compatible, non-active sink. Runs on the main thread.
++static void btif_av_src_multicast_start_peers() {
++  if (!btif_av_src_multicast_enabled()) return;
++  auto start_peers = []() {
++    for (auto it : btif_av_source.Peers()) {
++      const BtifAvPeer* peer = it.second;
++      if (peer->StateMachine().StateId() != BtifAvStateMachine::kStateOpened)
++        continue;
++      if (peer->CheckFlags(BtifAvPeer::kFlagPendingStart |
++                           BtifAvPeer::kFlagRemoteSuspend |
++                           BtifAvPeer::kFlagPendingStop))
++        continue;
++      if (!btif_av_src_multicast_peer_compatible(*peer)) continue;
++      LOG_INFO("%s: starting multicast peer %s", __func__,
++               peer->PeerAddress().ToString().c_str());
++      btif_av_source_dispatch_sm_event(peer->PeerAddress(),
++                                       BTIF_AV_START_STREAM_REQ_EVT);
++    }
++  };
++  do_in_main_thread(FROM_HERE, base::Bind(start_peers));
++}
++
+ /*****************************************************************************
+  * Local helper functions
+  *****************************************************************************/
+@@ -1861,6 +1929,13 @@ void BtifAvStateMachine::StateOpened::OnEnter() {
+                    BtifAvPeer::kFlagPendingStart |
+                    BtifAvPeer::kFlagPendingStop);
+ 
++  // Multicast: a sink that connects while the active peer is streaming
++  // joins the running stream.
++  if (peer_.IsSink() && !peer_.IsActivePeer() &&
++      btif_av_src_multicast_enabled() && btif_av_stream_started_ready()) {
++    btif_av_src_multicast_start_peers();
++  }
++
+   // Set the active peer if the first connected device.
+   // NOTE: This should be done only if we are A2DP Sink, because the A2DP Sink
+   // implementation in Java doesn't support active devices (yet).
+@@ -1932,7 +2007,14 @@ bool BtifAvStateMachine::StateOpened::ProcessEvent(uint32_t event,
+       // If remote tries to start A2DP when DUT is A2DP Source, then Suspend.
+       // If A2DP is Sink and call is active, then disconnect the AVDTP channel.
+       bool should_suspend = false;
+-      if (peer_.IsSink()) {
++      if (btif_av_src_multicast_peer(peer_)) {
++        // Multicast: a non-active sink keeps streaming the duplicated
++        // packets. The encoder and the audio HAL are owned by the active
++        // peer, so do not ACK the HAL or (re)start the encoder here.
++        LOG_INFO("%s: Peer %s : multicast stream started", __PRETTY_FUNCTION__,
++                 peer_.PeerAddress().ToString().c_str());
++        peer_.ClearFlags(BtifAvPeer::kFlagPendingStart);
++      } else if (peer_.IsSink()) {
+         if (!peer_.CheckFlags(BtifAvPeer::kFlagPendingStart |
+                               BtifAvPeer::kFlagRemoteSuspend)) {
+           LOG(WARNING) << __PRETTY_FUNCTION__ << ": Peer "
+@@ -2119,7 +2201,9 @@ bool BtifAvStateMachine::StateStarted::ProcessEvent(uint32_t event,
+                BtifAvEvent::EventName(event).c_str(),
+                peer_.FlagsToString().c_str());
+       // We were started remotely, just ACK back the local request
+-      if (peer_.IsSink()) btif_a2dp_on_started(peer_.PeerAddress(), nullptr);
++      // (a multicast peer never owns the audio HAL request)
++      if (peer_.IsSink() && !btif_av_src_multicast_peer(peer_))
++        btif_a2dp_on_started(peer_.PeerAddress(), nullptr);
+       break;
+ 
+     // FIXME -- use suspend = true always to work around issue with BTA AV
+@@ -3115,6 +3199,7 @@ void btif_av_stream_start(void) {
+   LOG_INFO("%s", __func__);
+   btif_av_source_dispatch_sm_event(btif_av_source_active_peer(),
+                                    BTIF_AV_START_STREAM_REQ_EVT);
++  btif_av_src_multicast_start_peers();
+ }
+ 
+ void src_do_suspend_in_main_thread(btif_av_sm_event_t event) {
