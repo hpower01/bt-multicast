@@ -92,7 +92,6 @@ jobs:
               platform/prebuilts/gradle-plugin platform/prebuilts/maven_repo/android platform/prebuilts/maven_repo/bumptech \
               platform/prebuilts/devtools platform/prebuilts/asuite platform/prebuilts/bundletool \
               platform/prebuilts/checkcolor platform/prebuilts/ktlint platform/prebuilts/remoteexecution-client \
-              $(grep -o 'name="kernel/prebuilts/[^"]*"' .repo/manifests/default.xml | cut -d'"' -f2) \
               $(grep -o 'name="platform/prebuilts/module_sdk/[^"]*"' .repo/manifests/default.xml | cut -d'"' -f2)
             do
               if grep -q "name=\"$p\"" .repo/manifests/default.xml; then
@@ -124,6 +123,9 @@ jobs:
       - name: Build
         run: |
           monitor &
+          # Keep temporary files on the big build volume (the root disk is almost full)
+          mkdir -p "$GITHUB_WORKSPACE/tmp"
+          export TMPDIR="$GITHUB_WORKSPACE/tmp"
           cd aosp
           export ALLOW_MISSING_DEPENDENCIES=true
           # Build a real .apex file in "apex" mode (not a flattened directory)
