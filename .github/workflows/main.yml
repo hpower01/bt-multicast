@@ -28,9 +28,9 @@ jobs:
       - name: Maximize disk space
         uses: easimon/maximize-build-space@v10
         with:
-          root-reserve-mb: 3072
+          root-reserve-mb: 6144
           temp-reserve-mb: 1024
-          swap-size-mb: 24576
+          swap-size-mb: 10240
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
@@ -54,17 +54,62 @@ jobs:
           git config --global user.name "builder"
           git config --global user.email "builder@example.com"
           git config --global color.ui false
+          # Prints free disk and memory every minute, so a failure shows its cause
+          cat > ~/bin/monitor <<'EOF'
+          #!/bin/bash
+          while sleep 60; do
+            echo "[monitor] build disk free: $(df -h --output=avail "$GITHUB_WORKSPACE" | tail -1)" \
+                 "| root free: $(df -h --output=avail / | tail -1)" \
+                 "| $(free -m | awk '/Mem/{print "RAM used " $3 "/" $2 " MB"}')" \
+                 "| $(free -m | awk '/Swap/{print "swap used " $3 "/" $2 " MB"}')"
+          done
+          EOF
+          chmod +x ~/bin/monitor
           df -h
+          free -m
 
       - name: Download AOSP source (${{ inputs.aosp_branch }})
         run: |
+          monitor & MON=$!
           mkdir -p aosp && cd aosp
           repo init -u https://android.googlesource.com/platform/manifest \
             -b "${{ inputs.aosp_branch }}" --depth=1 \
             -g default,-device,-darwin,-mips,-notdefault
-          repo sync -c -j8 --no-tags --no-clone-bundle --optimized-fetch \
-            --force-sync --fail-fast
+
+          # Skip large projects that are not needed to build the Bluetooth stack
+          mkdir -p .repo/local_manifests
+          {
+            echo '<?xml version="1.0" encoding="UTF-8"?>'
+            echo '<manifest>'
+            for p in \
+              platform/cts platform/test/cts-root \
+              platform/developers/build platform/developers/demos platform/developers/samples/android \
+              platform/external/chromium-webview \
+              platform/prebuilts/abi-dumps/ndk platform/prebuilts/abi-dumps/platform platform/prebuilts/abi-dumps/vndk \
+              platform/prebuilts/android-emulator platform/prebuilts/qemu-kernel \
+              platform/prebuilts/gcc/linux-x86/host/x86_64-w64-mingw32-4.8 \
+              platform/prebuilts/jdk/jdk8 platform/prebuilts/jdk/jdk9 \
+              platform/prebuilts/gradle-plugin platform/prebuilts/maven_repo/android platform/prebuilts/maven_repo/bumptech \
+              platform/prebuilts/devtools platform/prebuilts/asuite platform/prebuilts/bundletool \
+              platform/prebuilts/checkcolor platform/prebuilts/ktlint platform/prebuilts/remoteexecution-client \
+              platform/prebuilts/vndk/v28 platform/prebuilts/vndk/v29 platform/prebuilts/vndk/v30 \
+              platform/prebuilts/vndk/v31 platform/prebuilts/vndk/v32 \
+              $(grep -o 'name="kernel/prebuilts/[^"]*"' .repo/manifests/default.xml | cut -d'"' -f2) \
+              $(grep -o 'name="platform/prebuilts/module_sdk/[^"]*"' .repo/manifests/default.xml | cut -d'"' -f2)
+            do
+              if grep -q "name=\"$p\"" .repo/manifests/default.xml; then
+                echo "  <remove-project name=\"$p\" />"
+              fi
+            done
+            echo '</manifest>'
+          } > .repo/local_manifests/remove.xml
+          cat .repo/local_manifests/remove.xml
+
+          repo sync -c -j4 --no-tags --no-clone-bundle --optimized-fetch \
+            --force-sync --fail-fast -q
           df -h .
+          free -m
+          kill $MON
 
       - name: Apply multicast patch
         run: |
@@ -80,6 +125,7 @@ jobs:
 
       - name: Build
         run: |
+          monitor &
           cd aosp
           export ALLOW_MISSING_DEPENDENCIES=true
           # envsetup.sh is not written for "bash -e"
