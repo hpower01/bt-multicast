@@ -1,0 +1,169 @@
+name: Build Bluetooth A2DP multicast
+
+on:
+  workflow_dispatch:
+    inputs:
+      aosp_branch:
+        description: "AOSP tag matching the phone. M305 (TP1A.220624.014, patch 2023-04-05) = android-security-13.0.0_r6"
+        required: true
+        default: "android-security-13.0.0_r6"
+      mode:
+        description: "lib = only libbluetooth_jni.so (faster, recommended), apex = whole com.android.btservices"
+        required: true
+        default: "lib"
+        type: choice
+        options:
+          - lib
+          - apex
+
+jobs:
+  build:
+    # Use a PUBLIC repository: public repos get 4 CPUs / 16 GB RAM, private only 2 / 7.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      # The free runner has ~20 GB free; AOSP needs ~100 GB. Merge the free
+      # space of / and /mnt into one volume and add swap for the build.
+      - name: Maximize disk space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 3072
+          temp-reserve-mb: 1024
+          swap-size-mb: 24576
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Install build packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl python3 python-is-python3 zip unzip \
+            rsync libncurses5 fontconfig xsltproc libxml2-utils
+          mkdir -p ~/bin
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod +x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "builder"
+          git config --global user.email "builder@example.com"
+          git config --global color.ui false
+          df -h
+
+      - name: Download AOSP source (${{ inputs.aosp_branch }})
+        run: |
+          mkdir -p aosp && cd aosp
+          repo init -u https://android.googlesource.com/platform/manifest \
+            -b "${{ inputs.aosp_branch }}" --depth=1 \
+            -g default,-device,-darwin,-mips,-notdefault
+          repo sync -c -j8 --no-tags --no-clone-bundle --optimized-fetch \
+            --force-sync --fail-fast
+          df -h .
+
+      - name: Apply multicast patch
+        run: |
+          cd aosp/packages/modules/Bluetooth
+          git apply --verbose "$GITHUB_WORKSPACE/repo/a2dp_multicast.patch"
+          git diff --stat
+
+      - name: Free git objects (not needed for the build)
+        run: |
+          cd aosp
+          rm -rf .repo/project-objects .repo/projects
+          df -h .
+
+      - name: Build
+        run: |
+          cd aosp
+          export ALLOW_MISSING_DEPENDENCIES=true
+          # envsetup.sh is not written for "bash -e"
+          set +e
+          source build/envsetup.sh
+          lunch aosp_arm64-userdebug || exit 1
+          set -e
+          if [ "${{ inputs.mode }}" = "apex" ]; then
+            m -j"$(nproc)" com.android.btservices
+          else
+            m -j"$(nproc)" libbluetooth_jni
+          fi
+
+      - name: Package Magisk module
+        run: |
+          set -e
+          cd aosp
+          OUT_DIR="$GITHUB_WORKSPACE/out_artifacts"
+          MOD="$OUT_DIR/module"
+          mkdir -p "$MOD"
+
+          cat > "$MOD/module.prop" <<'EOF'
+          id=a2dp_multicast
+          name=Bluetooth A2DP Multicast
+          version=1
+          versionCode=1
+          author=local
+          description=Stream Bluetooth audio to several A2DP devices at once (AOSP patch)
+          EOF
+
+          cat > "$MOD/system.prop" <<'EOF'
+          persist.bluetooth.maxconnectedaudiodevices=2
+          persist.bluetooth.a2dp_multicast.enabled=true
+          EOF
+
+          if [ "${{ inputs.mode }}" = "apex" ]; then
+            APEX=$(find out/target/product -path '*/system/apex/com.android.btservices.apex' | head -n1)
+            echo "apex: $APEX"
+            mkdir -p "$MOD/system/apex"
+            cp "$APEX" "$MOD/system/apex/"
+            cp "$APEX" "$OUT_DIR/"
+          else
+            # The APEX variant of the library (not the "unstripped" copy)
+            LIB=$(find out/soong/.intermediates/packages/modules/Bluetooth/android/app/libbluetooth_jni \
+                    -path '*android_arm64*apex*' -name libbluetooth_jni.so -not -path '*unstripped*' | head -n1)
+            echo "lib: $LIB"
+            [ -n "$LIB" ]
+            mkdir -p "$MOD/bt"
+            cp "$LIB" "$MOD/bt/libbluetooth_jni.so"
+            cp "$LIB" "$OUT_DIR/"
+
+            # Bind-mount the new library over the one inside the APEX at boot.
+            cat > "$MOD/service.sh" <<'EOF'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          NEW="$MODDIR/bt/libbluetooth_jni.so"
+          for TARGET in /apex/com.android.btservices/lib64/libbluetooth_jni.so; do
+            i=0
+            until [ -f "$TARGET" ] || [ $i -ge 60 ]; do sleep 1; i=$((i+1)); done
+            [ -f "$TARGET" ] || continue
+            CTX=$(ls -Z "$TARGET" | awk '{print $1}')
+            chmod 644 "$NEW"
+            chcon "$CTX" "$NEW"
+            mount -o bind "$NEW" "$TARGET"
+          done
+          # Restart Bluetooth so it loads the new library
+          killall com.android.bluetooth 2>/dev/null || pkill -f com.android.bluetooth
+          EOF
+            chmod 755 "$MOD/service.sh"
+          fi
+
+          (cd "$MOD" && zip -qr "$OUT_DIR/a2dp_multicast_magisk.zip" .)
+          ls -la "$OUT_DIR"
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: a2dp-multicast-${{ inputs.mode }}-${{ inputs.aosp_branch }}
+          path: |
+            out_artifacts/*.zip
+            out_artifacts/*.so
+            out_artifacts/*.apex
+          if-no-files-found: error
+
+      - name: Disk usage on failure
+        if: failure()
+        run: df -h
