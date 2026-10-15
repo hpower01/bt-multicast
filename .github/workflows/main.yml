@@ -8,7 +8,7 @@ on:
         required: true
         default: "android-security-13.0.0_r6"
       mode:
-        description: "lib = only libbluetooth_jni.so (faster, recommended), apex = whole com.android.btservices"
+        description: "lib = only libbluetooth_jni.so (faster), apex = whole com.android.btservices"
         required: true
         default: "lib"
         type: choice
@@ -18,7 +18,6 @@ on:
 
 jobs:
   build:
-    # Use a PUBLIC repository: public repos get 4 CPUs / 16 GB RAM, private only 2 / 7.
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
@@ -28,12 +27,31 @@ jobs:
         with:
           root-reserve-mb: 6144
           temp-reserve-mb: 1024
-          swap-size-mb: 28672
+          # אנו מכבים כאן את ה-swap של הדיסק כדי שלא יחנוק את המערכת
+          swap-size-mb: 1 
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
           remove-codeql: "true"
           remove-docker-images: "true"
+
+      - name: Setup ZRAM and Memory Limits
+        run: |
+          # ביטול כל Swap שקיים על הדיסק האיטי
+          sudo swapoff -a || true
+          
+          # הפעלת ZRAM בגודל 16GB (דחיסת זיכרון בתוך ה-RAM)
+          sudo modprobe zram
+          sudo zramctl --find --size 16G
+          sudo mkswap /dev/zram0
+          sudo swapon /dev/zram0 --priority 100
+          
+          # הגדרות למערכת הלינוקס להעדפת שימוש ב-ZRAM
+          sudo sysctl -w vm.swappiness=100
+          sudo sysctl -w vm.watermark_scale_factor=125
+          
+          echo "Memory setup complete:"
+          free -h
 
       - name: Checkout this repository
         uses: actions/checkout@v4
@@ -52,7 +70,7 @@ jobs:
           git config --global user.name "builder"
           git config --global user.email "builder@example.com"
           git config --global color.ui false
-          # Prints free disk and memory every minute, so a failure shows its cause
+          
           cat > ~/bin/monitor <<'EOF'
           #!/bin/bash
           while sleep 60; do
@@ -63,8 +81,6 @@ jobs:
           done
           EOF
           chmod +x ~/bin/monitor
-          df -h
-          free -m
 
       - name: Download AOSP source (${{ inputs.aosp_branch }})
         run: |
@@ -74,7 +90,6 @@ jobs:
             -b "${{ inputs.aosp_branch }}" --depth=1 \
             -g default,-device,-darwin,-mips,-notdefault
 
-          # Skip large projects that are not needed to build the Bluetooth stack
           mkdir -p .repo/local_manifests
           {
             echo '<?xml version="1.0" encoding="UTF-8"?>'
@@ -97,33 +112,36 @@ jobs:
             done
             echo '</manifest>'
           } > .repo/local_manifests/remove.xml
-          cat .repo/local_manifests/remove.xml
 
           repo sync -c -j4 --no-tags --no-clone-bundle --optimized-fetch \
             --force-sync --fail-fast -q
-          df -h .
-          free -m
           kill $MON
 
       - name: Apply multicast patch
         run: |
           cd aosp/packages/modules/Bluetooth
           git apply --verbose "$GITHUB_WORKSPACE/repo/a2dp_multicast.patch"
-          git diff --stat
-
-      - name: Free git objects (not needed for the build)
+          
+      - name: Free git objects
         run: |
           cd aosp
           rm -rf .repo/project-objects .repo/projects
-          df -h .
 
       - name: Build
         run: |
           monitor &
           echo 1000 > /proc/self/oom_score_adj || true
-          sudo sysctl -w vm.swappiness=100 || true
+          
           mkdir -p "$GITHUB_WORKSPACE/tmp"
           export TMPDIR="$GITHUB_WORKSPACE/tmp"
+          
+          # הגבלות זיכרון קריטיות למערכת הבנייה
+          export GOGC=20                     # מנקה זיכרון זבל באגרסיביות
+          export GOMAXPROCS=1                # מגביל את מספר התהליכים שממפים קבצים במקביל
+          export MALLOC_ARENA_MAX=2          # חוסך זיכרון פנימי של C
+          export _JAVA_OPTIONS="-Xmx2g"      # מגביל תהליכי Java
+          export BUILD_BROKEN_DISABLE_BAZEL=true # מכבה את Bazel שלוקח הון זיכרון
+          
           cd aosp
           export ALLOW_MISSING_DEPENDENCIES=true
           set +e
@@ -131,12 +149,11 @@ jobs:
           banchan com.android.btservices arm64 userdebug || exit 1
           set -e
           
-          # `--skip-soong-tests` prevents compiling and running AOSP build system unit tests.
-          # Building `libbluetooth_jni` builds ONLY the c++ library instead of the entire APEX
+          # בנייה עם הגבלת משאבים ודילוג על טסטים
           if [ "${{ inputs.mode }}" = "apex" ]; then
-            m -j"$(nproc)" --skip-soong-tests apps_only dist
+            m -j2 --skip-soong-tests apps_only dist
           else
-            m -j"$(nproc)" --skip-soong-tests libbluetooth_jni
+            m -j2 --skip-soong-tests libbluetooth_jni
           fi
 
       - name: Package Magisk module
@@ -201,7 +218,6 @@ jobs:
           fi
 
           (cd "$MOD" && zip -qr "$OUT_DIR/a2dp_multicast_magisk.zip" .)
-          ls -la "$OUT_DIR"
 
       - name: Upload result
         uses: actions/upload-artifact@v4
@@ -212,7 +228,3 @@ jobs:
             out_artifacts/*.so
             out_artifacts/*.apex
           if-no-files-found: error
-
-      - name: Disk usage on failure
-        if: failure()
-        run: df -h
