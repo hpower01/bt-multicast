@@ -92,8 +92,6 @@ jobs:
               platform/prebuilts/gradle-plugin platform/prebuilts/maven_repo/android platform/prebuilts/maven_repo/bumptech \
               platform/prebuilts/devtools platform/prebuilts/asuite platform/prebuilts/bundletool \
               platform/prebuilts/checkcolor platform/prebuilts/ktlint platform/prebuilts/remoteexecution-client \
-              platform/prebuilts/vndk/v28 platform/prebuilts/vndk/v29 platform/prebuilts/vndk/v30 \
-              platform/prebuilts/vndk/v31 platform/prebuilts/vndk/v32 \
               $(grep -o 'name="kernel/prebuilts/[^"]*"' .repo/manifests/default.xml | cut -d'"' -f2) \
               $(grep -o 'name="platform/prebuilts/module_sdk/[^"]*"' .repo/manifests/default.xml | cut -d'"' -f2)
             do
@@ -128,6 +126,8 @@ jobs:
           monitor &
           cd aosp
           export ALLOW_MISSING_DEPENDENCIES=true
+          # Build a real .apex file in "apex" mode (not a flattened directory)
+          export OVERRIDE_TARGET_FLATTEN_APEX=false
           # envsetup.sh is not written for "bash -e"
           set +e
           source build/envsetup.sh
