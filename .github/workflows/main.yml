@@ -27,31 +27,13 @@ jobs:
         with:
           root-reserve-mb: 6144
           temp-reserve-mb: 1024
-          # אנו מכבים כאן את ה-swap של הדיסק כדי שלא יחנוק את המערכת
-          swap-size-mb: 1 
+          # אנו מחזירים כאן קובץ Swap ענק של 24GB כדי למנוע קריסת OOM מוחלטת
+          swap-size-mb: 24576 
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
           remove-codeql: "true"
           remove-docker-images: "true"
-
-      - name: Setup ZRAM and Memory Limits
-        run: |
-          # ביטול כל Swap שקיים על הדיסק האיטי
-          sudo swapoff -a || true
-          
-          # הפעלת ZRAM בגודל 16GB (דחיסת זיכרון בתוך ה-RAM)
-          sudo modprobe zram
-          sudo zramctl --find --size 16G
-          sudo mkswap /dev/zram0
-          sudo swapon /dev/zram0 --priority 100
-          
-          # הגדרות למערכת הלינוקס להעדפת שימוש ב-ZRAM
-          sudo sysctl -w vm.swappiness=100
-          sudo sysctl -w vm.watermark_scale_factor=125
-          
-          echo "Memory setup complete:"
-          free -h
 
       - name: Checkout this repository
         uses: actions/checkout@v4
@@ -71,6 +53,7 @@ jobs:
           git config --global user.email "builder@example.com"
           git config --global color.ui false
           
+          # מוניטור שידפיס את הזיכרון בכל דקה וימנע מגיטהאב לנתק את השרת עקב "חוסר פעילות"
           cat > ~/bin/monitor <<'EOF'
           #!/bin/bash
           while sleep 60; do
@@ -135,12 +118,11 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/tmp"
           export TMPDIR="$GITHUB_WORKSPACE/tmp"
           
-          # הגבלות זיכרון קריטיות למערכת הבנייה
-          export GOGC=20                     # מנקה זיכרון זבל באגרסיביות
-          export GOMAXPROCS=1                # מגביל את מספר התהליכים שממפים קבצים במקביל
-          export MALLOC_ARENA_MAX=2          # חוסך זיכרון פנימי של C
-          export _JAVA_OPTIONS="-Xmx2g"      # מגביל תהליכי Java
-          export BUILD_BROKEN_DISABLE_BAZEL=true # מכבה את Bazel שלוקח הון זיכרון
+          # --- הגבלות זיכרון חכמות ל-Soong ול-Go ---
+          export GOGC=50                     # דורש איסוף זבל לעיתים קרובות יותר
+          export GOMAXPROCS=2                # מגביל את מספר התהליכים שממפים את הפרויקט (מונע עומס וקריסה)
+          export MALLOC_ARENA_MAX=2          # חוסך פיצול זיכרון של גלייב C
+          export BUILD_BROKEN_DISABLE_BAZEL=true # Bazel לוקח משאבים אדירים באנדרואיד 13, נכבה אותו
           
           cd aosp
           export ALLOW_MISSING_DEPENDENCIES=true
@@ -149,7 +131,8 @@ jobs:
           banchan com.android.btservices arm64 userdebug || exit 1
           set -e
           
-          # בנייה עם הגבלת משאבים ודילוג על טסטים
+          # הבנייה מוגבלת כעת ל-2 מעבדים במקביל (במקום 4 או יותר) כדי לחסוך RAM
+          # הוספנו את --skip-soong-tests כדי לדלג על בדיקות המערכת הכבדות
           if [ "${{ inputs.mode }}" = "apex" ]; then
             m -j2 --skip-soong-tests apps_only dist
           else
