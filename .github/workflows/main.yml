@@ -39,11 +39,14 @@ jobs:
         with:
           path: repo
 
-      - name: Install build packages
+      - name: Install build packages (and fix Entropy)
         run: |
           sudo apt-get update
+          # התקנת haveged קריטית למניעת קפיאה של תהליכי Java/Go בשרתי ענן
           sudo apt-get install -y git curl python3 python-is-python3 zip unzip \
-            rsync libncurses5 fontconfig xsltproc libxml2-utils
+            rsync libncurses5 fontconfig xsltproc libxml2-utils haveged
+          sudo systemctl start haveged
+          
           mkdir -p ~/bin
           curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod +x ~/bin/repo
@@ -113,13 +116,19 @@ jobs:
           monitor &
           echo 1000 > /proc/self/oom_score_adj || true
           
+          # --- הפתרון לחנק הדיסק בשורש (Root) ---
+          # מעבירים פיזית את תקיית /tmp לכונן הגדול שיש בו 50GB פנויים
           mkdir -p "$GITHUB_WORKSPACE/tmp"
-          export TMPDIR="$GITHUB_WORKSPACE/tmp"
+          sudo mount --bind "$GITHUB_WORKSPACE/tmp" /tmp
+          export TMPDIR="/tmp"
+          export TEMP="/tmp"
+          export TMP="/tmp"
           
-          # --- הפתרון הקריטי ---
-          # פקודה זו מכבה לחלוטין את הרצת טסטים בסביבת Soong/Go של אנדרואיד
+          # --- ניקוי מערכות רקע שתוקעות את הבנייה ---
           export SKIP_SOONG_TESTS=true
-          export BUILD_BROKEN_DISABLE_BAZEL=true
+          export USE_BAZEL=false
+          export USE_BAZEL_ANALYSIS=false
+          export SOONG_UI_VERBOSE=true
           
           cd aosp
           export ALLOW_MISSING_DEPENDENCIES=true
@@ -129,11 +138,12 @@ jobs:
           banchan com.android.btservices arm64 userdebug || exit 1
           set -e
           
-          # אנחנו מדלגים על הטסטים ורצים על 4 מעבדים במקביל (כי יש לך 16GB זיכרון וזה יעבוד מעולה)
+          echo "Starting the build process..."
+          # אנחנו מוסיפים את 'showcommands' כדי שהמערכת תדפיס למסך הכל ולא תקפא בשקט
           if [ "${{ inputs.mode }}" = "apex" ]; then
-            m -j4 --skip-soong-tests apps_only dist
+            m -j4 showcommands apps_only dist
           else
-            m -j4 --skip-soong-tests libbluetooth_jni
+            m -j4 showcommands libbluetooth_jni
           fi
 
       - name: Package Magisk module
