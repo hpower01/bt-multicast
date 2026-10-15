@@ -27,8 +27,7 @@ jobs:
         with:
           root-reserve-mb: 6144
           temp-reserve-mb: 1024
-          # Swap בגודל 8GB - מונע קריסת OOM אבל מונע מהדיסק לקפוא לזמן ארוך
-          swap-size-mb: 8192 
+          swap-size-mb: 8192
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
@@ -53,7 +52,6 @@ jobs:
           git config --global user.email "builder@example.com"
           git config --global color.ui false
           
-          # מוניטור שמדפיס מצב משאבים כל דקה (גם שומר את השרת "ער")
           cat > ~/bin/monitor <<'EOF'
           #!/bin/bash
           while sleep 60; do
@@ -73,7 +71,6 @@ jobs:
             -b "${{ inputs.aosp_branch }}" --depth=1 \
             -g default,-device,-darwin,-mips,-notdefault
 
-          # מחיקת פרויקטים כבדים שלא רלוונטיים לבלוטות'
           mkdir -p .repo/local_manifests
           {
             echo '<?xml version="1.0" encoding="UTF-8"?>'
@@ -119,34 +116,24 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/tmp"
           export TMPDIR="$GITHUB_WORKSPACE/tmp"
           
-          # --- הגדרות זיכרון אגרסיביות במיוחד למערכת הבנייה ---
-          export GOGC=15                     # ניקוי זיכרון מהיר ותכוף מאוד ב-Go
-          export GOMAXPROCS=1                # הגבלת הסורק לליבה אחת כדי למנוע קפיצת RAM מטורפת
+          # --- הפתרון הקריטי ---
+          # פקודה זו מכבה לחלוטין את הרצת טסטים בסביבת Soong/Go של אנדרואיד
+          export SKIP_SOONG_TESTS=true
           export BUILD_BROKEN_DISABLE_BAZEL=true
-          export SOONG_GEN_RUST_PROJECT=false
-          export SOONG_GEN_COMPDB=false
           
           cd aosp
           export ALLOW_MISSING_DEPENDENCIES=true
+          
           set +e
           source build/envsetup.sh
           banchan com.android.btservices arm64 userdebug || exit 1
           set -e
           
-          echo "=== Step 1: Generating Build Map (Soong) ==="
-          # הפקודה הזו רק סורקת את הקבצים ובונה את מפת הקימפול.
-          # זה השלב שתמיד קפא עד עכשיו, ולכן הוא מוגבל לליבה אחת.
-          m nothing
-          
-          echo "=== Step 2: Compiling the actual library ==="
-          # לאחר שהסריקה עברה בהצלחה, משחררים קצת הגבלות להאצת הקימפול
-          export GOMAXPROCS=2
-          export GOGC=50
-          
+          # אנחנו מדלגים על הטסטים ורצים על 4 מעבדים במקביל (כי יש לך 16GB זיכרון וזה יעבוד מעולה)
           if [ "${{ inputs.mode }}" = "apex" ]; then
-            m -j2 --skip-soong-tests apps_only dist
+            m -j4 --skip-soong-tests apps_only dist
           else
-            m -j2 --skip-soong-tests libbluetooth_jni
+            m -j4 --skip-soong-tests libbluetooth_jni
           fi
 
       - name: Package Magisk module
