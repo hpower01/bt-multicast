@@ -27,7 +27,8 @@ jobs:
         with:
           root-reserve-mb: 6144
           temp-reserve-mb: 1024
-          swap-size-mb: 8192
+          # הגדלת Swap ל-16GB (יחד עם 16GB RAM יש לנו 32GB מרחב נשימה!)
+          swap-size-mb: 16384
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
@@ -172,10 +173,8 @@ jobs:
           monitor &
           echo 1000 > /proc/self/oom_score_adj || true
           
-          export GOMEMLIMIT=12GiB
+          # ביטלנו את GOMEMLIMIT ואת GOGC - אין יותר סחרור של מנוע ה-Go!
           export GOMAXPROCS=4
-          export GOGC=30
-          
           export BUILD_BROKEN_DISABLE_BAZEL=true
           export SOONG_GEN_RUST_PROJECT=false
           export SOONG_GEN_COMPDB=false
