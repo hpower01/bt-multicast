@@ -142,14 +142,20 @@ jobs:
                                   fp.write("package main\\n")
           '
 
-      - name: Prune unneeded heavy folders (Cuts 60% of modules and prevents OOM)
+      - name: Prune unneeded heavy folders
         run: |
           cd aosp
-          # מחיקת תיקיות כבדות וטסטים (כולל art/test שגרם לשגיאה)
+          # מחיקת תיקיות כבדות וטסטים
           rm -rf cts packages/apps development developers platform_testing test tools sdk bootable art/test
-          # מחיקה אוטומטית של כל קובץ הגדרות שמנסה להשתמש ב-csuite_test
+          
+          # מחיקת קבצי הגדרות של ייצוא בדיקות ART שמחפשים את CTS
+          rm -f art/build/sdk/Android.bp
+          rm -rf art/build/apex
+          
+          # מחיקה אוטומטית של כל קובץ שמזכיר את הכלים האלו
           grep -rl "csuite_test" . --include="Android.bp" | xargs -r rm -f
-          echo "Unneeded modules pruned successfully!"
+          grep -rl "art_cts_jvmti_test_library" . --include="Android.bp" | xargs -r rm -f
+          echo "Pruning complete!"
 
       - name: Apply multicast patch
         run: |
