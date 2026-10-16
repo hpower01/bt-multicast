@@ -145,8 +145,10 @@ jobs:
       - name: Prune unneeded heavy folders (Cuts 60% of modules and prevents OOM)
         run: |
           cd aosp
-          # מחיקת תיקיות ענק שבלוטות לא צריך (חוסך 40,000 קבצי הגדרה)
-          rm -rf cts packages/apps development developers platform_testing test tools sdk bootable
+          # מחיקת תיקיות כבדות וטסטים (כולל art/test שגרם לשגיאה)
+          rm -rf cts packages/apps development developers platform_testing test tools sdk bootable art/test
+          # מחיקה אוטומטית של כל קובץ הגדרות שמנסה להשתמש ב-csuite_test
+          grep -rl "csuite_test" . --include="Android.bp" | xargs -r rm -f
           echo "Unneeded modules pruned successfully!"
 
       - name: Apply multicast patch
@@ -164,9 +166,8 @@ jobs:
           monitor &
           echo 1000 > /proc/self/oom_score_adj || true
           
-          # תקרת ברזל: שפת Go לעולם לא תעבור 12GB ותפנה זיכרון תמיד
           export GOMEMLIMIT=12GiB
-          export GOMAXPROCS=2
+          export GOMAXPROCS=4
           export GOGC=30
           
           export BUILD_BROKEN_DISABLE_BAZEL=true
